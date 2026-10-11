@@ -1,0 +1,4 @@
+paho-mqtt>=2.1,<3
+networkx>=3.2,<4
+cryptography>=42,<47
+pyvis>=0.3.2,<1
