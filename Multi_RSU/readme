@@ -1,0 +1,230 @@
+TinyDLT
+A lightweight multi-RSU DAG ledger for intelligent transportation systems. ESP32-class vehicles act as thin clients; several independently operated roadside units (RSUs) each keep a full replica of the ledger. A transaction is confirmed only when a quorum of RSUs has validated it and a later transaction has approved it, so no single RSU can confirm anything on its own.
+This repository contains the RSU software, the vehicle firmware, the experiment procedure, the analysis scripts and the raw logs behind the paper:
+> **tinyDLT: A Lightweight Multi-RSU DAG Ledger with Quorum Confirmation for Intelligent Transportation Systems: Design, Hardware Implementation, and Evaluation** (under review).
+---
+Contents
+How it works
+Repository layout
+Requirements
+Setting up the RSUs
+Setting up the vehicles
+Running an experiment
+Reproducing the paper's experiments
+Configuration reference
+Results in brief
+Limitations
+Troubleshooting
+Citation
+License
+---
+How it works
+![tinyDLT architecture](docs/architecture.png)
+Vehicles (ESP32). Each vehicle asks its ingress RSU for two parents (tips), builds a transaction over a canonical byte encoding, solves a 12-bit proof-of-work (PoW), signs it with Ed25519 and publishes it over MQTT. A vehicle keeps one transaction in flight and fails over to the next RSU after two unanswered tip requests.
+RSUs (Python). Every RSU validates every transaction in eight ordered stages:
+#	Stage	Rejection reasons	Trust penalty
+1	Structure (fields, `id = SHA-256(body)`, duplicate)	`missing_<field>`, `malformed_transaction`, `txid_mismatch`, `duplicate_txid`	no
+2	Authentication (enrolled key, Ed25519 signature)	`unknown_vehicle_or_signature`, `bad_vehicle_signature`	no
+3	Trust (only if `TRUST_ENFORCE=1`)	`low_trust`	–
+4	Freshness (±30 s, peer clock offset compensated)	`timestamp_invalid`	yes
+5	Replay and rate (sequence number; 20 tx per 60 s at the ingress RSU)	`replay_sequence`, `rate_limit`	yes
+6	Proof-of-work	`invalid_pow`, `unexpected_pow_difficulty`	yes
+7	DAG parents (exist; at the ingress RSU a non-tip parent must be ≤ 30 s old)	`missing_parent` (quarantined), `parent_too_old`	no
+8	Plausibility (speed 0–160 km/h, coordinates, acceleration, event type)	`speed_out_of_range`, `invalid_location`, `weak_plausibility`	no
+Trust is penalised only after the sender has been authenticated, so a forged transaction cannot lower a victim's score.
+Replication. RSUs exchange signed messages over each other's MQTT brokers:
+```
+vehicle ──request_tips / submit_tx──▶ ingress RSU
+ingress RSU ──PREPARE──▶ peers          (transaction + up to 200 ancestors)
+peers ──VOTE (ACCEPT / REJECT)──▶ ingress RSU
+any RSU that confirms ──COMMIT──▶ all peers   (carries the signed votes)
+HELLO: key proof, clock offset, vehicle key registry
+SYNC:  back-fill of missing transactions after a restart
+```
+Confirmation rule. Transaction i is confirmed when at least Q of N RSUs have signed an ACCEPT vote and its cumulative weight (itself plus all approvers) has reached θ = 2, that is, a later transaction approves it. The evaluated configuration is N = 3, Q = 2: it tolerates one crashed RSU. The weight test is bounded and does not depend on ledger size.
+Tip selection. A width controller keeps the tip set near L* = 3. Below the target, a new transaction approves recent, under-approved transactions and widens the DAG. At or above it, the transaction merges the oldest tip with one other. Serving the oldest tip first gives near first-in, first-out consumption, and that is what makes the Little's-law latency model of the paper work.
+Recovery. A restarted RSU back-fills missing history by SYNC and adopts a past confirmation only when Q distinct peers report it.
+---
+Repository layout
+```
+tinyDLT/
+├── rsu/
+│   ├── rsu_server.py              # RSU node, final build (2026-10-02-boundedcw-trustfix)
+│   ├── rsu_server_first_build.py  # first build, used for some runs in the paper (see below)
+│   ├── rsu1.env  rsu2.env  rsu3.env
+│   └── test_boundedcw.py          # checks the bounded weight test against the full computation
+├── firmware/
+│   ├── tinydlt_esp32_vehicle/tinydlt_esp32_vehicle.ino
+│   └── tinydlt_esp8266_vehicle/tinydlt_esp8266_vehicle.ino
+├── analysis/
+│   ├── collect_hardware_run.py    # folds one run's logs into results/
+│   ├── analyse_results.py         # figures/ and tables/ from every run so far
+│   ├── energy_model.py            # datasheet-based energy per transaction
+│   ├── baselines.py
+│   ├── make_paper_figures.py      # Figures 5 and 6 of the paper
+│   ├── check_load_runs.py         # closed-loop check and time-resolved RSU load
+│   ├── plot_saturation.py
+│   └── fix_runjson_intervals.py   # one-off: interval convention of the load runs
+├── results/                       # raw logs and databases of every run in the paper
+├── docs/
+│   ├── architecture.png
+│   ├── RUN_GUIDE.md
+│   └── EXPERIMENT_PLAN.md
+└── README.md
+```
+Two RSU builds. `rsu_server.py` (md5 `46d2c835a05aed5ccd0d13ae7ad9d73b`) is the final build. It updates node states incrementally and decides the weight condition with a bounded test. The first build (md5 `6539e691dda1c907730a74df4533914e`) recomputed the state of every node after each insertion. The configuration runs (one, two and three RSUs) and the failure runs in the paper were recorded with the first build. The load runs and attack runs were recorded with the final build. With trust enforcement off, both builds make the same validation, voting and confirmation decisions; they differ only in CPU cost. Use the final build for new experiments.
+---
+Requirements
+RSUs (three machines on one LAN in the paper)
+Linux, Python 3.10 or later
+Eclipse Mosquitto (one broker per RSU, TCP 1883)
+`pip install paho-mqtt networkx cryptography`
+Analysis machine only: `pip install pandas numpy scipy matplotlib`
+Vehicles
+ESP32 development boards (ESP32-WROOM-32 in the paper); an ESP8266 sketch is included but was not used for the results
+Arduino IDE with the esp32 by Espressif board package
+Libraries: PubSubClient (Nick O'Leary), ArduinoJson (Benoit Blanchon), Crypto (Rhys Weatherley, provides `Ed25519.h`)
+Network: a single 2.4 GHz Wi-Fi network that all nodes can reach. A mobile hotspot was used in the paper.
+---
+Setting up the RSUs
+1. Mosquitto must accept connections from the LAN. Add to `/etc/mosquitto/mosquitto.conf`:
+```
+listener 1883
+allow_anonymous true
+```
+Then restart it with `sudo systemctl restart mosquitto`. Check with `sudo netstat -tulpn | grep 1883`; it should show `0.0.0.0:1883`.
+> The testbed runs MQTT without TLS. Transactions and RSU messages are signed, but the traffic is not confidential. See [Limitations](#limitations).
+2. Edit the env files. Each RSU has its own file. Set `RSU_ID`, `RSU_IP` and `PEERS` to your addresses:
+```bash
+# rsu1.env
+RSU_ID=RSU1
+RSU_IP=10.20.141.118
+BROKER_HOST=127.0.0.1
+BROKER_PORT=1883
+PEERS=RSU2=10.20.141.168:1883,RSU3=10.20.141.128:1883
+RSU_COUNT=3
+QUORUM=2
+POW_DIFFICULTY=12
+CW_THRESHOLD=2
+TIP_POLICY=adaptive
+TARGET_TIPS=3
+VERBOSE=0          # per-vote console output perturbs timing
+PERF_INTERVAL_S=1
+```
+3. Keys.
+On first start each RSU generates `RSUx_ed25519_private.pem`.
+Peer public keys live in `rsu_peer_keys.json`, as `{"RSU2": "<64 hex>", ...}`. To pin them automatically, start all three RSUs once with `ENROLL_PEERS=1`, then set it back to `0` for measurement runs.
+Vehicle public keys live in `vehicle_keys.json`, as `{"vehicle_01": "<64 hex>", ...}`. One RSU is enough: the registry is shared with the peers during the HELLO handshake.
+4. Start.
+```bash
+set -a; source ./rsu1.env; set +a
+python3 rsu_server.py
+```
+The banner should show `Server ver : 2026-10-02-boundedcw-trustfix`. Wait until every RSU prints `HANDSHAKE OK` for each peer.
+---
+Setting up the vehicles
+Open `firmware/tinydlt_esp32_vehicle/tinydlt_esp32_vehicle.ino` and set:
+```cpp
+const char* VEHICLE_ID    = "vehicle_01";      // unique per board
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+Rsu RSUS[] = {                                  // only RSUs that are running
+  {"RSU1", "10.20.141.118", 1883},
+  {"RSU2", "10.20.141.168", 1883},
+  {"RSU3", "10.20.141.128", 1883},
+};
+
+const uint8_t  POW_BITS        = 12;            // must equal POW_DIFFICULTY on the RSUs
+const uint32_t MIN_INTERVAL_MS = 5000;          // default workload: U(5, 10) s
+const uint32_t MAX_INTERVAL_MS = 10000;
+const int      ATTACK_MODE     = ATTACK_NONE;
+```
+Flash the board. On first boot it prints its `PUBLIC_KEY`; add that key to `vehicle_keys.json` on one RSU. When the board starts submitting, the serial monitor shows `TRANSACTION SUBMITTED`. Without internet access the board takes its clock from the RSU's tip replies (`USE_RSU_TIME = true`).
+---
+Running an experiment
+Every run follows the same steps. RSU1 also serves as the analysis machine.
+```bash
+# a. clean (every RSU taking part)
+cd ~/Documents/multirsu && rm -f logs_*.csv perf_*.csv tinyDLT_*.db*
+
+# b. start each RSU and wait for HANDSHAKE OK with every peer
+set -a; source ./rsuN.env; set +a; python3 rsu_server.py
+
+# c. power on the vehicles; run about 10 minutes
+# d. unplug the vehicles, wait 30 s, stop all RSUs together (Ctrl+C)
+
+# e. copy each RSU's logs to RSU1
+scp logs_RSU2.csv perf_RSU2.csv tinyDLT_RSU2.db user@RSU1:~/Documents/multirsu/incoming/   # on RSU2, RSU3
+cp  logs_RSU1.csv perf_RSU1.csv tinyDLT_RSU1.db incoming/                                  # on RSU1
+
+# f. register the run (RSU1), then empty incoming/
+python3 collect_hardware_run.py --src incoming \
+    --experiment configs --cell 3rsu --load load-esp32 --rep 1 \
+    --rsu-count 3 --quorum 2 --vehicles 3 --interval 7
+rm incoming/*
+
+# g. analyse (re-run any time; it uses every run so far)
+python3 analyse_results.py --device esp32      # -> figures/ and tables/
+```
+The collector refuses a run whose logs contain more than one session, whose RSUs stopped at different times, or which duplicates an earlier run. Use `--overwrite` to replace a run deliberately.
+Each RSU writes three files per run:
+`logs_RSUx.csv`, with one row per acceptance, rejection and confirmation (stage, reason, vote count, latency components and the vehicle-reported phase timings);
+`perf_RSUx.csv`, with one-second samples of ledger size, tip count, confirmed count, CPU time and memory;
+the SQLite database `tinyDLT_RSUx.db`.
+---
+Reproducing the paper's experiments
+All runs use three ESP32 vehicles and last about 10 minutes. `docs/EXPERIMENT_PLAN.md` gives every collect command.
+Exp.	What	Setup	`collect_hardware_run.py` options
+E1	1, 2, 3 RSUs	1 RSU: `RSU_COUNT=1 QUORUM=1 PEERS=`; 2 RSUs: `RSU_COUNT=2 QUORUM=2`, RSU3 removed from `PEERS`	`--experiment configs --cell 1rsu|2rsu|3rsu --rsu-count … --quorum …`
+E2	Load sweep	3 RSUs; firmware `MIN_INTERVAL_MS = MAX_INTERVAL_MS` = 200, 400, 700, 1200, 2500; raise `MAX_TX_PER_VEHICLE_WINDOW` so the rate limit does not cap the load	`--experiment load --cell 3rsu --load load-<Z/3>s --interval <Z/3>`
+E3	RSU failure	Stop RSU3 at about 2:00 and restart it at about 3:00 without deleting its files; once with `QUORUM=2`, once with `QUORUM=3`	`--experiment faults --cell unit-failure --fault 120:kill:RSU3 --fault 180:restart:RSU3`
+E4	Attacks	`vehicle_02` with one `ATTACK_MODE` per run (`ATTACK_INVALID_POW`, `ATTACK_BAD_SIGNATURE`, `ATTACK_REPLAY`, `ATTACK_SPAM`, `ATTACK_FAKE_DATA`); one extra invalid-PoW run with `TRUST_ENFORCE=1`	`--experiment attacks --cell <type> --attack-vehicle vehicle_02 --attack-type <type>`
+Interval convention. Load folder names and `interval_s` in `run.json` use the aggregate interval, which is the per-vehicle interval Z divided by the number of vehicles. The paper's per-vehicle intervals of 0.2, 0.4, 0.7, 1.2 and 2.5 s are therefore stored as `load-0.07s`, `load-0.13s`, `load-0.23s`, `load-0.4s` and `load-0.83s`. The paper's load runs were collected with the per-vehicle value and corrected afterwards with `fix_runjson_intervals.py`. Run that script only once.
+Paper figures. From the folder that holds the final-build runs:
+```bash
+python3 analyse_results.py --device esp32   # writes tables/T2_aggregated_ci95.csv
+python3 make_paper_figures.py               # Fig5_load, Fig6_rsu_cost (png + pdf), prints every number shown
+python3 check_load_runs.py                  # closed-loop residuals and per-third RSU load
+```
+---
+Configuration reference
+The values below are the ones used in the paper. All are environment variables of `rsu_server.py`.
+Variable	Paper value	Meaning
+`RSU_COUNT` / `QUORUM`	3 / 2	number of RSUs N, votes needed Q
+`CW_THRESHOLD`	2	weight θ; 2 = at least one approver
+`POW_DIFFICULTY`	12	leading zero bits (about 4096 hashes)
+`TIP_POLICY` / `TARGET_TIPS`	adaptive / 3	tip policy (`strict` keeps two current tips) and target width L*
+`TIP_WINDOW_S` / `MAX_APPROVERS`	30 / 2	widening window and approver cap
+`TIMESTAMP_SKEW_S`	30	freshness window
+`MAX_TX_PER_VEHICLE_WINDOW` / `RATE_WINDOW_S`	20 / 60	rate limit (raised for the load sweep)
+`TRUST_REWARD` / `TRUST_PENALTY` / `TRUST_THRESHOLD`	0.01 / 0.10 / 0.30	trust update; start value 0.5
+`TRUST_ENFORCE`	0 (1 in one attack run)	reject vehicles below the threshold
+`MAX_SPEED_KMH` / `MAX_ACCEL_KMH_S`	160 / 25	plausibility limits
+`PREPARE_RETRY_S` / `PREPARE_MAX_RETRIES`	5 / 6	PREPARE retransmission
+`SYNC_INTERVAL_S` / `SYNC_CATCHUP_S`	20 / 3	SYNC period; 3 s while the ledger grows
+`CLOCK_COMPENSATION`	1	correct freshness by the measured peer clock offset
+`ENROLL_PEERS`	0	1 = pin peer keys on first contact (bootstrap only)
+`VERBOSE` / `PERF_INTERVAL_S`	0 / 1	console output and performance sampling period
+`DAG_HTML_INTERVAL_S`	0	0 = export the HTML view of the DAG only at shutdown
+---
+Results in brief
+These figures come from a hardware testbed of three RSUs (Q = 2) and three ESP32 vehicles, with one run of about 10 minutes per configuration. Details and caveats are in the paper.
+	
+Throughput	0.37 tx/s at the default load, up to 3.38 tx/s in the load sweep; it follows the vehicles' closed-loop limit, and accepted and confirmed rates agree within 1.1%
+Latency (median, end to end)	8.62 s at the default load, 2.35–2.70 s between 1.8 and 3.4 tx/s; the wait for an approving transaction dominates
+Latency model	E[L]/λ + Δ/2 predicts the approval wait within −6.8% to +5.3%
+Quorum time	19 ms with one RSU; 0.21–0.26 s with two or three RSUs; up to 0.42 s under load
+RSU CPU	12–31 ms per transaction depending on the machine; the busiest RSU used about 0.11 of a core at the highest load
+RSU failure	with 2-of-3, the survivors kept confirming and the restarted RSU converged to an identical confirmed set; with 3-of-3, confirmation stopped
+Attacks	corrupted signatures, invalid PoW and implausible data all rejected; 77 of 78 replayed sequence numbers rejected; flooding held to 20 tx per 60 s; 3 of 917 honest transactions rejected (expired parent)
+PoW and energy	median PoW 135 ms on the ESP32 at d = 12; 77–145 mJ per transaction (calculated from measured phase durations and datasheet currents)
+---
+Troubleshooting
+Symptom	Likely cause
+ESP32: `Connecting to MQTT...failed, rc=-2`	Mosquitto listens only on 127.0.0.1; add `listener 1883` and `allow_anonymous true`, then restart
+RSU: `unknown_vehicle_or_signature`	the vehicle's public key is missing from `vehicle_keys.json`
+Many `timestamp_invalid`	the vehicle clock is not set; keep `USE_RSU_TIME = true` on an isolated network
+No `HANDSHAKE OK`	wrong `PEERS` address, a peer key not in `rsu_peer_keys.json`, or different `rsu_server.py` versions (compare `md5sum`)
+Replica agreement near 0 in the analysis	the three `.db` files are not from the same run
+Two servers on one machine	check with `pgrep -af rsu_server.py`; there must be exactly one
